@@ -1,0 +1,25 @@
+
+<!-- WARAKADO VISION アプリ埋め込みコード -->
+<div id="warakado-app-container" style="width: 100%; border-radius: 20px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.1); background: #f8fafc; border: 1px solid #e2e8f0;">
+    <iframe 
+        id="warakado-iframe"
+        src="https://あなたのアプリ名.vercel.app" 
+        style="width: 100%; height: 500px; border: none; display: block; transition: height 0.3s ease-out;" 
+        allow="camera; microphone; geolocation"
+        loading="lazy">
+    </iframe>
+</div>
+
+<script>
+    // iFrameの高さ調整（アプリ側からのメッセージ受信）
+    window.addEventListener('message', function(event) {
+        // セキュリティのため、必要に応じてオリジンチェックを追加してください
+        if (event.data && event.data.type === 'resize') {
+            var iframe = document.getElementById('warakado-iframe');
+            if (iframe && event.data.height > 100) {
+                // 受信した高さに書き換える
+                iframe.style.height = event.data.height + 'px';
+            }
+        }
+    }, false);
+</script>

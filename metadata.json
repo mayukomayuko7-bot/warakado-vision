@@ -1,0 +1,8 @@
+{
+  "name": "WARAKADO VISION Web Member App",
+  "description": "WARAKADO VISIONの移動式エンターテインメントと各種サービスを提供する公式会員アプリ。フードビジネス、レンタルスペース、タロット占い、デザイン制作、音楽制作、ノスタルジー体験など、多様な『笑顔の門』を届けます。",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
