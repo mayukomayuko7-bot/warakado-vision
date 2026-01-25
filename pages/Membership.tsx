@@ -26,7 +26,6 @@ interface SocialPost {
 }
 
 const LOCAL_RECIPES_KEY = 'warakado_local_recipes';
-const LOCAL_OMIKUJI_KEY = 'warakado_omikuji_result';
 
 // 今日の日付を取得するヘルパー (日本時間)
 const getTodayString = () => {
@@ -124,28 +123,12 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
   };
 
   useEffect(() => {
-    // 1. レシピの読み込み
+    // 1. まずローカルデータを読み込む（即時表示のため）
     const localData = localStorage.getItem(LOCAL_RECIPES_KEY);
     const localRecipes: RecipePost[] = localData ? JSON.parse(localData) : [];
     setRecipes(localRecipes);
 
-    // 2. おみくじ結果の復元
-    const savedOmikuji = localStorage.getItem(LOCAL_OMIKUJI_KEY);
-    if (savedOmikuji) {
-      try {
-        const parsed = JSON.parse(savedOmikuji);
-        // 保存されている日付が今日と同じであれば結果をセット
-        if (parsed.date === getTodayString()) {
-          setOmikujiResult(parsed);
-        } else {
-          localStorage.removeItem(LOCAL_OMIKUJI_KEY);
-        }
-      } catch (e) {
-        console.warn("Omikuji restoration failed", e);
-      }
-    }
-
-    // 3. Firebase同期
+    // 2. Firebaseの設定がある場合は同期を開始
     if (isFirebaseConfigured && auth.currentUser) {
       try {
         const q = query(collection(db, "recipes"), orderBy("id", "desc"));
@@ -153,11 +136,16 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
           const fbRecipes: RecipePost[] = [];
           snapshot.forEach((doc) => {
             const data = doc.data() as RecipePost;
+            // FirestoreのドキュメントIDを保持していないため、データの中身でマージ
             fbRecipes.push(data);
           });
+          
+          // ローカルとリモートをマージして重複を排除（IDベース）
           const combined = [...fbRecipes, ...localRecipes].filter((v, i, a) => a.findIndex(t => t.id === v.id) === i);
           setRecipes(combined.sort((a, b) => b.id - a.id));
-        }, (err) => {});
+        }, (err) => {
+          // 権限エラーなどはwarnにとどめる
+        });
         return () => unsubscribe();
       } catch (err) {
         console.warn("Firestore query setup failed:", err);
@@ -273,6 +261,7 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
   };
 
   const handleLike = async (recipeId: number) => {
+    // 楽観的UI更新
     setRecipes(prev => prev.map(r => {
       if (r.id === recipeId) {
         return { ...r, likes: (r.likes || 0) + 1 };
@@ -280,6 +269,7 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
       return r;
     }));
 
+    // Firestore更新
     if (isFirebaseConfigured && auth.currentUser) {
       try {
         const q = query(collection(db, "recipes"), where("id", "==", recipeId));
@@ -307,82 +297,109 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
     }
   };
 
-  const handleOmikuji = () => {
-    const result = { 
-      date: getTodayString(), 
-      result: Math.random() > 0.85 ? '大吉' : '吉', 
-      benefit: '本日使える50円引きクーポン' 
-    };
-    setOmikujiResult(result);
-    localStorage.setItem(LOCAL_OMIKUJI_KEY, JSON.stringify(result));
-  };
-
   const submitRecipe = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!member) return;
+    
+    // 投稿制限チェック
     if (isPostLimitReached) {
       alert('本日の投稿受付は終了しました。また明日投稿してね♪');
       return;
     }
+    
     setIsSubmittingRecipe(true);
+    
     try {
       let finalImageUrl = recipeForm.image;
+      
+      // 画像がある場合、まず圧縮・リサイズを行う
       if (finalImageUrl && finalImageUrl.startsWith('data:')) {
         try {
+          // 強力に圧縮 (600px, 0.6) -> 100KB以下を目指す
           finalImageUrl = await compressImage(finalImageUrl, 600, 0.6);
         } catch (compressErr) {
           console.warn("Image compression failed, using original", compressErr);
         }
       }
+
+      // 画像がない場合のフォールバック
       if (!finalImageUrl) {
         finalImageUrl = 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=500';
       }
+      
+      // 画像アップロード処理 (Firebase Storage)
       if (isFirebaseConfigured && auth.currentUser && finalImageUrl.startsWith('data:')) {
         try {
           const safeFileName = `recipes/${Date.now()}_${Math.random().toString(36).substring(2, 9)}.jpg`;
           const storageRef = ref(storage, safeFileName);
-          await uploadString(storageRef, finalImageUrl, 'data_url', { contentType: 'image/jpeg' });
+          
+          await uploadString(storageRef, finalImageUrl, 'data_url', {
+             contentType: 'image/jpeg',
+          });
           finalImageUrl = await getDownloadURL(storageRef);
         } catch (imageErr: any) {
           console.warn("Storage upload failed (using Base64 fallback):", imageErr.message);
         }
       }
+
       const newRecipe: RecipePost = {
         id: Date.now(),
         author: member.nickname,
         menuName: recipeForm.menuName,
         description: recipeForm.description,
         image: finalImageUrl,
-        date: getTodayString(),
+        date: getTodayString(), // 日本時間の日付
         likes: 0
       };
+
+      // 1. Firebase Firestoreへ保存
       if (isFirebaseConfigured && auth.currentUser) {
         try {
           if (finalImageUrl.length < 1000000) { 
              await addDoc(collection(db, "recipes"), newRecipe);
+          } else {
+             console.warn("Compressed image still too large for Firestore, skipping cloud save.");
           }
         } catch (dbErr) {
-          console.warn("Firestore save failed:", dbErr);
+          console.warn("Firestore save failed (running in offline/local mode):", dbErr);
         }
       }
-      const saveToLocal = (items: RecipePost[]) => {
-          localStorage.setItem(LOCAL_RECIPES_KEY, JSON.stringify(items));
-      };
-      const localData = localStorage.getItem(LOCAL_RECIPES_KEY);
-      let localRecipes: RecipePost[] = localData ? JSON.parse(localData) : [];
-      if (localRecipes.length > 30) localRecipes = localRecipes.slice(0, 30);
+
+      // 2. ローカルストレージへ保存
       try {
-          saveToLocal([newRecipe, ...localRecipes]);
-      } catch (quotaErr: any) {
-          if (quotaErr.name === 'QuotaExceededError' || quotaErr.code === 22) {
-              saveToLocal([newRecipe, ...localRecipes.slice(0, 10)]);
-          }
+        const saveToLocal = (items: RecipePost[]) => {
+            localStorage.setItem(LOCAL_RECIPES_KEY, JSON.stringify(items));
+        };
+
+        const localData = localStorage.getItem(LOCAL_RECIPES_KEY);
+        let localRecipes: RecipePost[] = localData ? JSON.parse(localData) : [];
+        
+        if (localRecipes.length > 30) {
+          localRecipes = localRecipes.slice(0, 30);
+        }
+        
+        try {
+            saveToLocal([newRecipe, ...localRecipes]);
+        } catch (quotaErr: any) {
+            if (quotaErr.name === 'QuotaExceededError' || quotaErr.code === 22) {
+                const reduced = localRecipes.slice(0, 10);
+                saveToLocal([newRecipe, ...reduced]);
+            } else {
+                throw quotaErr;
+            }
+        }
+      } catch (localErr) {
+        console.error("Local storage error:", localErr);
       }
+
+      // 3. UIの即時反映
       setRecipes(prev => [newRecipe, ...prev].filter((v, i, a) => a.findIndex(t => t.id === v.id) === i).sort((a,b) => b.id - a.id));
+      
       setRecipeForm({ menuName: '', description: '', image: '' });
       alert('レシピを投稿しました！');
     } catch (e) {
-      alert('投稿処理が完了しました');
+      console.error("Fatal Submit Error:", e);
+      alert('投稿処理が完了しました（一部保存制限あり）');
       setRecipeForm({ menuName: '', description: '', image: '' });
     } finally {
       setIsSubmittingRecipe(false);
@@ -419,6 +436,7 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
     );
   }
 
+  // ポイント進捗計算
   const pointProgress = Math.min((member.points / 10) * 100, 100);
 
   return (
@@ -427,11 +445,13 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
       <div className="bg-warakado-gradient rounded-[2.5rem] p-8 text-white shadow-2xl relative overflow-hidden group border border-white/20">
         <div className="absolute top-0 right-0 w-32 h-32 bg-white/10 rounded-full -mr-16 -mt-16 blur-2xl"></div>
         <div className="absolute bottom-0 left-0 w-24 h-24 bg-orange-400/20 rounded-full -ml-12 -mb-12 blur-xl"></div>
+        
         <div className="relative z-10">
           <div className="flex justify-between items-start mb-6">
             <h3 className="font-black italic text-lg tracking-tighter drop-shadow-sm">WARAKADO VISION</h3>
             <span className="font-mono text-[10px] font-black bg-white/20 px-3 py-1 rounded-full border border-white/20 backdrop-blur-sm">{member.serialNumber}</span>
           </div>
+          
           <div className="flex justify-between items-end">
             <div>
               <p className="text-3xl font-black mb-1 drop-shadow-md">{member.nickname} <span className="text-sm font-bold opacity-80">様</span></p>
@@ -439,28 +459,41 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
                 <span className="bg-white/30 px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-widest border border-white/10">Standard Member</span>
               </div>
             </div>
+            
             <div className="text-right bg-white/10 backdrop-blur-md p-4 rounded-3xl border border-white/20 shadow-inner min-w-[140px]">
               <div className="flex items-center justify-end gap-2 mb-1">
                 <i className="fa-solid fa-star text-yellow-400 text-xs animate-pulse"></i>
                 <p className="text-xs font-black uppercase tracking-tighter opacity-80">Points</p>
               </div>
-              <p className="text-4xl font-black mb-1 leading-none">{member.points}<span className="text-sm ml-1 font-bold">pt</span></p>
+              <p className="text-4xl font-black mb-1 leading-none">
+                {member.points}<span className="text-sm ml-1 font-bold">pt</span>
+              </p>
               <div className="h-1.5 w-full bg-white/20 rounded-full overflow-hidden mb-1">
-                <div className="h-full bg-yellow-400 shadow-[0_0_10px_rgba(250,204,21,0.5)] transition-all duration-1000" style={{ width: `${pointProgress}%` }}></div>
+                <div 
+                  className="h-full bg-yellow-400 shadow-[0_0_10px_rgba(250,204,21,0.5)] transition-all duration-1000" 
+                  style={{ width: `${pointProgress}%` }}
+                ></div>
               </div>
               <p className="text-[9px] font-black text-yellow-200 drop-shadow-sm">10ポイントでグッズ交換！</p>
             </div>
           </div>
+          
           <div className="mt-4 flex justify-between items-center">
             <button onClick={onLogout} className="bg-white/10 px-4 py-2 rounded-full text-[10px] font-black border border-white/20 hover:bg-white/30 transition-all active:scale-95 backdrop-blur-sm">LOGOUT</button>
-            {member.points >= 10 && <span className="bg-yellow-400 text-orange-900 px-3 py-1 rounded-full text-[9px] font-black animate-bounce shadow-lg">交換可能です！</span>}
+            {member.points >= 10 && (
+              <span className="bg-yellow-400 text-orange-900 px-3 py-1 rounded-full text-[9px] font-black animate-bounce shadow-lg">交換可能です！</span>
+            )}
           </div>
         </div>
       </div>
 
       <div className="flex justify-center px-4">
-        <button onClick={() => setShowStaffModal(true)} className="text-[10px] font-bold text-slate-400 border border-slate-300 rounded-full px-6 py-2 hover:bg-slate-100 transition-colors flex items-center gap-2">
-          <i className="fa-solid fa-store"></i>店舗スタッフ用：ポイント付与
+        <button
+          onClick={() => setShowStaffModal(true)}
+          className="text-[10px] font-bold text-slate-400 border border-slate-300 rounded-full px-6 py-2 hover:bg-slate-100 transition-colors flex items-center gap-2"
+        >
+          <i className="fa-solid fa-store"></i>
+          店舗スタッフ用：ポイント付与
         </button>
       </div>
 
@@ -486,7 +519,8 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
               <div className="space-y-6 animate-fade-in">
                 <div className="bg-gradient-to-r from-orange-500 to-amber-500 p-8 rounded-[2.5rem] text-white shadow-lg text-center relative overflow-hidden group">
                   <h3 className="text-xl md:text-2xl font-black mb-3 flex items-center justify-center gap-2">
-                    <i className="fa-solid fa-fire-burner animate-bounce"></i>アレンジレシピ大募集！
+                    <i className="fa-solid fa-fire-burner animate-bounce"></i>
+                    アレンジレシピ大募集！
                   </h3>
                   <div className="text-xs font-bold opacity-95 leading-relaxed px-2 space-y-1">
                     <p>キッチンカーまたはオンラインショップにて販売中の</p>
@@ -497,28 +531,55 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
                   <div className="mt-4 flex justify-between items-end">
                       <span className="text-[10px] font-black bg-black/20 px-2 py-1 rounded">本日: {todaysRecipes.length}/{DAILY_POST_LIMIT} 件</span>
                   </div>
+                  <i className="fa-solid fa-utensils absolute -left-4 -bottom-4 text-8xl opacity-20 rotate-12"></i>
                 </div>
+
                 <form onSubmit={submitRecipe} className="space-y-4 bg-slate-50 p-5 rounded-3xl border border-slate-200">
-                  <input type="text" placeholder="メニュー名" required disabled={isPostLimitReached} value={recipeForm.menuName} onChange={e => setRecipeForm({...recipeForm, menuName: e.target.value})} className="w-full bg-white border border-slate-200 rounded-2xl px-4 py-4 text-sm font-bold outline-none" />
-                  <div onClick={() => !isPostLimitReached && fileInputRef.current?.click()} className={`w-full aspect-video rounded-2xl border-2 border-dashed flex flex-col items-center justify-center cursor-pointer overflow-hidden ${recipeForm.image ? 'bg-white' : 'bg-slate-100'}`}>
-                    {recipeForm.image ? <img src={recipeForm.image} alt="Preview" className="w-full h-full object-cover" /> : <><i className="fa-solid fa-camera text-3xl text-slate-400 mb-2"></i><span className="text-[10px] font-black text-slate-400">写真をアップロード</span></>}
+                  <input type="text" placeholder="メニュー名" required disabled={isPostLimitReached} value={recipeForm.menuName} onChange={e => setRecipeForm({...recipeForm, menuName: e.target.value})} className="w-full bg-white border border-slate-200 rounded-2xl px-4 py-4 text-sm font-bold focus:border-orange-400 outline-none transition-all disabled:opacity-50" />
+                  <div onClick={() => !isPostLimitReached && fileInputRef.current?.click()} className={`w-full aspect-video rounded-2xl border-2 border-dashed flex flex-col items-center justify-center cursor-pointer overflow-hidden transition-all ${recipeForm.image ? 'border-orange-400 bg-white' : 'border-slate-300 bg-slate-100 hover:border-orange-300'} ${isPostLimitReached ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                    {recipeForm.image ? <img src={recipeForm.image} alt="Preview" className="w-full h-full object-cover" /> : <><i className="fa-solid fa-camera text-3xl text-slate-400 mb-2"></i><span className="text-[10px] font-black text-slate-400 uppercase">写真をアップロード</span></>}
                   </div>
                   <input type="file" ref={fileInputRef} onChange={handleImageChange} accept="image/*" className="hidden" disabled={isPostLimitReached} />
-                  <textarea placeholder="作り方やこだわり..." required disabled={isPostLimitReached} value={recipeForm.description} onChange={e => setRecipeForm({...recipeForm, description: e.target.value})} className="w-full bg-white border border-slate-200 rounded-2xl px-4 py-4 text-sm font-bold h-32 resize-none" />
-                  <button type="submit" disabled={isSubmittingRecipe || isPostLimitReached} className={`w-full py-4 rounded-2xl font-black shadow-md ${isPostLimitReached ? 'bg-slate-400 text-white' : 'bg-orange-600 text-white'}`}>
-                    {isSubmittingRecipe ? '送信中...' : isPostLimitReached ? 'また明日投稿してね♪' : 'レシピを投稿する'}
+                  <textarea placeholder="作り方やこだわり、隠し味などを入力..." required disabled={isPostLimitReached} value={recipeForm.description} onChange={e => setRecipeForm({...recipeForm, description: e.target.value})} className="w-full bg-white border border-slate-200 rounded-2xl px-4 py-4 text-sm font-bold h-32 focus:border-orange-400 outline-none transition-all resize-none disabled:opacity-50" />
+                  <button 
+                    type="submit" 
+                    disabled={isSubmittingRecipe || isPostLimitReached} 
+                    className={`w-full py-4 rounded-2xl font-black shadow-md active:scale-95 transition-all disabled:opacity-70 disabled:active:scale-100 ${isPostLimitReached ? 'bg-slate-400 text-white cursor-not-allowed' : 'bg-orange-600 text-white'}`}
+                  >
+                    {isSubmittingRecipe ? <><i className="fa-solid fa-circle-notch animate-spin mr-2"></i>送信中...</> : isPostLimitReached ? 'また明日投稿してね♪' : 'レシピを投稿する'}
                   </button>
                 </form>
+
                 <div className="space-y-4">
-                  {todaysRecipes.map(r => (
-                    <div key={r.id} className="flex flex-col gap-3 p-4 bg-white rounded-3xl border border-slate-100 shadow-sm">
-                      <div className="flex gap-4">
-                        <img src={r.image} className="w-20 h-20 rounded-2xl object-cover flex-shrink-0" alt="" />
-                        <div className="flex-1 min-w-0"><p className="text-sm font-black truncate">{r.menuName}</p><p className="text-[10px] text-slate-400 font-bold">by {r.author}</p><p className="text-xs text-slate-600 line-clamp-2">{r.description}</p></div>
-                      </div>
-                      <div className="flex justify-end pt-2 border-t border-slate-50"><button onClick={() => handleLike(r.id)} className="flex items-center gap-2 bg-pink-50 text-pink-600 px-4 py-1.5 rounded-full text-xs font-black">UMATCH! {r.likes || 0}</button></div>
+                  <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2">Today's Recipes</h4>
+                  {todaysRecipes.length === 0 ? (
+                    <div className="text-center py-16 bg-slate-50 rounded-3xl border-2 border-dashed border-slate-200">
+                      <p className="text-xs text-slate-400 font-bold italic">本日の投稿はまだありません。<br/>最初の投稿をお待ちしています！</p>
+                      <p className="text-[10px] text-slate-300 mt-2">※レシピは毎日0時にリセットされます</p>
                     </div>
-                  ))}
+                  ) : (
+                    todaysRecipes.map(r => (
+                      <div key={r.id} className="flex flex-col gap-3 p-4 bg-white rounded-3xl border border-slate-100 shadow-sm hover:shadow-md transition-all animate-fade-in">
+                        <div className="flex gap-4">
+                          <img src={r.image} className="w-20 h-20 rounded-2xl object-cover bg-slate-100 flex-shrink-0 shadow-inner" alt="" />
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-black text-slate-900 truncate">{r.menuName}</p>
+                            <p className="text-[10px] text-slate-400 font-bold mb-1 uppercase">by {r.author}</p>
+                            <p className="text-xs text-slate-600 line-clamp-2 leading-relaxed">{r.description}</p>
+                          </div>
+                        </div>
+                        <div className="flex justify-end pt-2 border-t border-slate-50">
+                            <button 
+                              onClick={() => handleLike(r.id)}
+                              className="flex items-center gap-2 bg-pink-50 text-pink-600 px-4 py-1.5 rounded-full text-xs font-black hover:bg-pink-100 transition-colors active:scale-95 group"
+                            >
+                                <i className="fa-solid fa-heart group-hover:scale-125 transition-transform duration-300"></i>
+                                <span>UMATCH! {r.likes || 0}</span>
+                            </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
                 </div>
               </div>
             )}
@@ -527,30 +588,78 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
               <div className="text-center py-6 animate-fade-in flex flex-col items-center justify-center min-h-[450px]">
                 {showTarotFrame ? (
                   <div className="w-full h-full space-y-4">
-                    <div className="flex justify-between items-center px-2"><span className="text-[10px] font-black text-indigo-600 tracking-widest italic">WARAKADO TAROT APP</span><button onClick={() => setShowTarotFrame(false)} className="bg-red-500 text-white px-4 py-1.5 rounded-full text-[10px] font-black shadow-md">終了</button></div>
-                    <div className="rounded-[2.5rem] overflow-hidden shadow-2xl border-4 border-indigo-900 aspect-[9/16] bg-slate-900 max-h-[600px] mx-auto"><iframe src="https://warakado-tarot-space-975824544217.us-west1.run.app/" className="w-full h-full" allow="camera; microphone" /></div>
+                    <div className="flex justify-between items-center px-2">
+                      <span className="text-[10px] font-black text-indigo-600 uppercase tracking-widest italic">WARAKADO TAROT APP</span>
+                      <button onClick={() => setShowTarotFrame(false)} className="bg-red-500 text-white px-4 py-1.5 rounded-full text-[10px] font-black shadow-md">終了</button>
+                    </div>
+                    <div className="rounded-[2.5rem] overflow-hidden shadow-2xl border-4 border-indigo-900 aspect-[9/16] bg-slate-900 max-h-[600px] mx-auto">
+                      <iframe src="https://warakado-tarot-space-581971413306.us-west1.run.app" className="w-full h-full" allow="camera; microphone" />
+                    </div>
                   </div>
                 ) : (
                   <div className="space-y-6 w-full max-w-sm px-2">
-                    <div className="w-24 h-24 bg-indigo-50 text-indigo-600 rounded-[2.5rem] flex items-center justify-center text-5xl mx-auto shadow-inner border border-indigo-100 rotate-3 transition-transform hover:rotate-6"><i className="fa-solid fa-wand-sparkles"></i></div>
-                    <div className="space-y-1"><h3 className="text-2xl font-black text-slate-900">会員限定タロット</h3><p className="text-sm font-bold text-slate-500 italic">月3回無料</p></div>
+                    <div className="w-24 h-24 bg-indigo-50 text-indigo-600 rounded-[2.5rem] flex items-center justify-center text-5xl mx-auto shadow-inner border border-indigo-100 rotate-3 transition-transform hover:rotate-6">
+                      <i className="fa-solid fa-wand-sparkles"></i>
+                    </div>
+                    <div>
+                      <h3 className="text-2xl font-black text-slate-900 mb-1">会員限定タロット</h3>
+                      <div className="text-[10px] text-slate-500 font-bold space-y-0.5">
+                        <p>※タロットアプリでの個人情報収集はございませんのでお気軽にご利用ください。</p>
+                        <p>※お手持ちのスマートフォンの環境により動作しない場合がございますので<br/>先ずは無料クレジットにて動作確認後、クレジットの購入をお願いします。</p>
+                      </div>
+                    </div>
                     <div className="flex flex-col gap-4 w-full">
-                      <button onClick={handleUseTarot} className="w-full bg-indigo-900 text-white py-5 rounded-[1.5rem] font-black text-xl shadow-xl active:scale-95 transition-all"><i className="fa-solid fa-hat-wizard mr-3"></i>占いを開始</button>
+                      <button onClick={handleUseTarot} className="w-full bg-indigo-900 text-white py-5 rounded-[1.5rem] font-black text-xl shadow-xl active:scale-95 transition-all">
+                        <i className="fa-solid fa-hat-wizard mr-3"></i>占いを開始
+                      </button>
+                      
                       <div className="bg-gradient-to-br from-indigo-50 to-white p-6 rounded-[2.5rem] border-2 border-indigo-100 shadow-sm text-left relative overflow-hidden">
-                        <h4 className="text-[10px] font-black text-indigo-600 tracking-[0.2em] mb-1">Premium Plan</h4><p className="text-sm font-black text-slate-900">プレミアムクレジット購入</p>
-                        <div className="bg-white/70 p-4 rounded-2xl border border-indigo-100 mb-5 space-y-3 shadow-inner"><div className="flex gap-2"><i className="fa-solid fa-circle-exclamation text-indigo-600 mt-1 text-[10px]"></i><p className="text-[9px] text-indigo-900 font-bold leading-tight">Square購入時に、本アプリと同じメールアドレスをご使用ください。</p></div></div>
+                        <h4 className="text-[10px] font-black text-indigo-600 uppercase tracking-[0.2em] mb-1">Premium Plan</h4>
+                        <p className="text-sm font-black text-slate-900">プレミアムクレジット購入</p>
+                        
+                        <div className="bg-white/70 p-4 rounded-2xl border border-indigo-100 mb-5 space-y-3 shadow-inner">
+                          <div className="flex gap-2">
+                            <i className="fa-solid fa-circle-exclamation text-indigo-600 mt-1 text-[10px]"></i>
+                            <p className="text-[9px] text-indigo-900 font-bold leading-tight">Square購入時に、本アプリと同じメールアドレスをご使用ください。</p>
+                          </div>
+                        </div>
+
                         <div className="space-y-4">
-                          <button onClick={generatePaymentKey} className="w-full bg-white text-indigo-900 py-4 rounded-2xl font-black text-sm border-2 border-indigo-900 hover:bg-indigo-900 hover:text-white transition-all">1,000円/30回クレジットを購入</button>
+                          <button 
+                            onClick={generatePaymentKey}
+                            className="w-full bg-white text-indigo-900 py-4 rounded-2xl font-black text-sm text-center border-2 border-indigo-900 shadow-sm hover:bg-indigo-900 hover:text-white transition-all active:scale-95"
+                          >
+                            1,000円/30回クレジットを購入
+                          </button>
+
                           <div className="pt-4 border-t border-indigo-100">
-                            <p className="text-[10px] font-black text-indigo-400 tracking-widest mb-2 ml-1">購入キーをお持ちの方</p>
-                            <div className="flex gap-2 items-center"><button onClick={handleVerifyKey} disabled={isVerifyingKey || !inputKey} className="flex-shrink-0 bg-indigo-600 text-white px-5 py-3 rounded-xl text-[11px] font-black shadow-md disabled:opacity-50">{isVerifyingKey ? '確認中' : '有効化'}</button><input type="text" placeholder="キーを入力" value={inputKey} onChange={e => setInputKey(e.target.value)} className="flex-1 min-w-0 bg-white border-2 border-indigo-100 rounded-xl px-3 py-3 text-xs font-black outline-none focus:border-indigo-400 uppercase tracking-widest" /></div>
+                            <p className="text-[10px] font-black text-indigo-400 uppercase tracking-widest mb-2 ml-1">ログインキーをお持ちの方</p>
+                            <div className="flex gap-2 items-center">
+                              {/* ボタンを左側に配置、サイズ固定 */}
+                              <button 
+                                onClick={handleVerifyKey}
+                                disabled={isVerifyingKey || !inputKey}
+                                className="flex-shrink-0 bg-indigo-600 text-white px-5 py-3 rounded-xl text-[11px] font-black shadow-md active:scale-95 transition-all disabled:opacity-50 whitespace-nowrap"
+                              >
+                                {isVerifyingKey ? '確認中' : '有効化'}
+                              </button>
+                              {/* 入力欄を右側に配置 */}
+                              <input 
+                                type="text" 
+                                placeholder="キーを入力" 
+                                value={inputKey}
+                                onChange={e => setInputKey(e.target.value)}
+                                className="flex-1 min-w-0 bg-white border-2 border-indigo-100 rounded-xl px-3 py-3 text-xs font-black outline-none focus:border-indigo-400 transition-all uppercase tracking-widest"
+                              />
+                            </div>
                           </div>
                         </div>
                       </div>
                     </div>
+
                     <div className="flex justify-center gap-10 mt-6 pt-6 border-t border-slate-100">
-                      <div className="text-center"><p className="text-[10px] font-black text-slate-400 tracking-widest mb-1">Free Uses</p><p className="text-xl font-black text-slate-900">{3 - member.tarotUsesCount}/3</p></div>
-                      <div className="text-center"><p className="text-[10px] font-black text-slate-400 tracking-widest mb-1">Credits</p><p className="text-xl font-black text-indigo-600">{member.tarotCredits}pt</p></div>
+                      <div className="text-center"><p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Free Uses</p><p className="text-xl font-black text-slate-900">{3 - member.tarotUsesCount}/3</p></div>
+                      <div className="text-center"><p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Credits</p><p className="text-xl font-black text-indigo-600">{member.tarotCredits}pt</p></div>
                     </div>
                   </div>
                 )}
@@ -559,7 +668,7 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
 
             {activeTab === 'omikuji' && (
               <div className="text-center py-10 animate-fade-in flex flex-col items-center justify-center min-h-[450px]">
-                {omikujiResult && omikujiResult.date === getTodayString() ? (
+                {omikujiResult && omikujiResult.date === new Date().toDateString() ? (
                   <div className="bg-white p-10 rounded-[3rem] border-4 border-orange-500 shadow-2xl scale-110">
                     <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Today's Fortune</p>
                     <h4 className="text-7xl font-black text-orange-600 mb-4 tracking-tighter">{omikujiResult.result}</h4>
@@ -570,10 +679,9 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
                     <div className="mb-6 space-y-1">
                       <p className="text-sm font-bold text-slate-500">本日使えるクーポンが当たるかも！？</p>
                       <p className="text-lg font-black text-orange-500">運だめしおみくじ毎日開催中！</p>
-                      <p className="text-[10px] text-slate-400 font-bold">※毎日0:00にリセットされます</p>
                     </div>
                     <button 
-                      onClick={handleOmikuji} 
+                      onClick={() => setOmikujiResult({ date: new Date().toDateString(), result: Math.random() > 0.85 ? '大吉' : '吉', benefit: '次回50円引きクーポン' })} 
                       className="w-56 h-56 bg-orange-600 text-white rounded-[4rem] font-black text-3xl shadow-2xl border-4 border-orange-400 active:scale-90 hover:rotate-6 transition-all"
                     >
                       運試し！
@@ -601,13 +709,27 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
       </div>
 
       {showStaffModal && (
-        <div className="fixed inset-0 z-50 bg-slate-900/80 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="bg-white rounded-[2.5rem] p-8 w-full max-w-sm shadow-2xl border border-white/20 text-center">
-            <div className="w-12 h-12 bg-orange-100 text-orange-600 rounded-full flex items-center justify-center text-xl mx-auto mb-4"><i className="fa-solid fa-store"></i></div>
-            <h3 className="text-lg font-black mb-2 uppercase tracking-tighter">Staff Confirmation</h3>
-            <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest mb-6">パスワードを入力</p>
-            <input type="password" className="w-full bg-slate-50 border-2 border-slate-100 rounded-2xl px-4 py-3 text-center text-xl font-mono tracking-widest outline-none focus:border-orange-400 mb-4" placeholder="••••••••" value={staffPassword} onChange={(e) => setStaffPassword(e.target.value)} autoFocus />
-            <div className="flex gap-3"><button onClick={() => { setShowStaffModal(false); setStaffPassword(''); }} className="flex-1 bg-slate-100 text-slate-500 py-3 rounded-xl font-black text-xs hover:bg-slate-200">キャンセル</button><button onClick={handleStaffPointGrant} className="flex-1 bg-orange-600 text-white py-3 rounded-xl font-black text-xs shadow-lg active:scale-95 transition-transform">付与する</button></div>
+        <div className="fixed inset-0 z-50 bg-slate-900/80 backdrop-blur-md flex items-center justify-center p-4 animate-fade-in">
+          <div className="bg-white rounded-[2.5rem] p-8 w-full max-w-sm shadow-2xl border border-white/20 text-center animate-scale-in">
+            <div className="w-12 h-12 bg-orange-100 text-orange-600 rounded-full flex items-center justify-center text-xl mx-auto mb-4">
+              <i className="fa-solid fa-store"></i>
+            </div>
+            <h3 className="text-lg font-black text-slate-900 mb-2">STAFF CONFIRMATION</h3>
+            <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest mb-6">ポイント付与のパスワードを入力</p>
+            
+            <input 
+              type="password"
+              className="w-full bg-slate-50 border-2 border-slate-100 rounded-2xl px-4 py-3 text-center text-xl font-mono tracking-widest outline-none focus:border-orange-400 transition-all mb-4"
+              placeholder="••••••••"
+              value={staffPassword}
+              onChange={(e) => setStaffPassword(e.target.value)}
+              autoFocus
+            />
+            
+            <div className="flex gap-3">
+              <button onClick={() => { setShowStaffModal(false); setStaffPassword(''); }} className="flex-1 bg-slate-100 text-slate-500 py-3 rounded-xl font-black text-xs hover:bg-slate-200 transition-colors">キャンセル</button>
+              <button onClick={handleStaffPointGrant} className="flex-1 bg-orange-600 text-white py-3 rounded-xl font-black text-xs shadow-lg active:scale-95 transition-transform">付与する</button>
+            </div>
           </div>
         </div>
       )}
