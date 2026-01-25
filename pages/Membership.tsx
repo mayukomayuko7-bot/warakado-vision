@@ -27,9 +27,14 @@ interface SocialPost {
 
 const LOCAL_RECIPES_KEY = 'warakado_local_recipes';
 
-// 今日の日付を取得するヘルパー (日本時間)
+// 今日の日付を取得するヘルパー (日本時間・東京 0時リセット基準)
 const getTodayString = () => {
-  return new Date().toLocaleDateString('ja-JP');
+  return new Intl.DateTimeFormat('ja-JP', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    timeZone: 'Asia/Tokyo'
+  }).format(new Date());
 };
 
 // 画像圧縮ユーティリティ (設定を強化: 600px, 0.6)
@@ -136,11 +141,9 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
           const fbRecipes: RecipePost[] = [];
           snapshot.forEach((doc) => {
             const data = doc.data() as RecipePost;
-            // FirestoreのドキュメントIDを保持していないため、データの中身でマージ
             fbRecipes.push(data);
           });
           
-          // ローカルとリモートをマージして重複を排除（IDベース）
           const combined = [...fbRecipes, ...localRecipes].filter((v, i, a) => a.findIndex(t => t.id === v.id) === i);
           setRecipes(combined.sort((a, b) => b.id - a.id));
         }, (err) => {
@@ -154,8 +157,44 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
   }, []);
 
   useEffect(() => {
+    // おみくじ結果を復元
+    const savedOmikuji = localStorage.getItem(`warakado_omikuji_${member?.email}`);
+    if (savedOmikuji) {
+      setOmikujiResult(JSON.parse(savedOmikuji));
+    }
+  }, [member?.email]);
+
+  useEffect(() => {
     if (activeTab === 'instagram' && socialFeed.length === 0) fetchRealtimeSocialFeed();
   }, [activeTab]);
+
+  const handleDrawOmikuji = () => {
+    const rand = Math.random();
+    let result = "";
+    let benefit = "";
+
+    // 確率設定
+    if (rand < 0.10) { // 大吉 10%
+      result = "大吉";
+      benefit = "本日100円引きクーポン";
+    } else if (rand < 0.25) { // 吉 15%
+      result = "吉";
+      benefit = "本日50円引きクーポン";
+    } else if (rand < 0.45) { // 中吉 20%
+      result = "中吉";
+      benefit = "本日30円引きクーポン";
+    } else if (rand < 0.80) { // 末吉 35%
+      result = "末吉";
+      benefit = "本日10円引きクーポン";
+    } else { // はずれ 20%
+      result = "はずれ";
+      benefit = "残念！また明日引いてね";
+    }
+
+    const newResult = { date: todayStr, result, benefit };
+    setOmikujiResult(newResult);
+    localStorage.setItem(`warakado_omikuji_${member?.email}`, JSON.stringify(newResult));
+  };
 
   const handlePointRequest = async () => {
     if (!member) return;
@@ -261,7 +300,6 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
   };
 
   const handleLike = async (recipeId: number) => {
-    // 楽観的UI更新
     setRecipes(prev => prev.map(r => {
       if (r.id === recipeId) {
         return { ...r, likes: (r.likes || 0) + 1 };
@@ -269,7 +307,6 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
       return r;
     }));
 
-    // Firestore更新
     if (isFirebaseConfigured && auth.currentUser) {
       try {
         const q = query(collection(db, "recipes"), where("id", "==", recipeId));
@@ -301,7 +338,6 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
     e.preventDefault();
     if (!member) return;
     
-    // 投稿制限チェック
     if (isPostLimitReached) {
       alert('本日の投稿受付は終了しました。また明日投稿してね♪');
       return;
@@ -312,22 +348,18 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
     try {
       let finalImageUrl = recipeForm.image;
       
-      // 画像がある場合、まず圧縮・リサイズを行う
       if (finalImageUrl && finalImageUrl.startsWith('data:')) {
         try {
-          // 強力に圧縮 (600px, 0.6) -> 100KB以下を目指す
           finalImageUrl = await compressImage(finalImageUrl, 600, 0.6);
         } catch (compressErr) {
           console.warn("Image compression failed, using original", compressErr);
         }
       }
 
-      // 画像がない場合のフォールバック
       if (!finalImageUrl) {
         finalImageUrl = 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=500';
       }
       
-      // 画像アップロード処理 (Firebase Storage)
       if (isFirebaseConfigured && auth.currentUser && finalImageUrl.startsWith('data:')) {
         try {
           const safeFileName = `recipes/${Date.now()}_${Math.random().toString(36).substring(2, 9)}.jpg`;
@@ -348,11 +380,10 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
         menuName: recipeForm.menuName,
         description: recipeForm.description,
         image: finalImageUrl,
-        date: getTodayString(), // 日本時間の日付
+        date: todayStr,
         likes: 0
       };
 
-      // 1. Firebase Firestoreへ保存
       if (isFirebaseConfigured && auth.currentUser) {
         try {
           if (finalImageUrl.length < 1000000) { 
@@ -365,36 +396,16 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
         }
       }
 
-      // 2. ローカルストレージへ保存
       try {
-        const saveToLocal = (items: RecipePost[]) => {
-            localStorage.setItem(LOCAL_RECIPES_KEY, JSON.stringify(items));
-        };
-
         const localData = localStorage.getItem(LOCAL_RECIPES_KEY);
         let localRecipes: RecipePost[] = localData ? JSON.parse(localData) : [];
-        
-        if (localRecipes.length > 30) {
-          localRecipes = localRecipes.slice(0, 30);
-        }
-        
-        try {
-            saveToLocal([newRecipe, ...localRecipes]);
-        } catch (quotaErr: any) {
-            if (quotaErr.name === 'QuotaExceededError' || quotaErr.code === 22) {
-                const reduced = localRecipes.slice(0, 10);
-                saveToLocal([newRecipe, ...reduced]);
-            } else {
-                throw quotaErr;
-            }
-        }
+        if (localRecipes.length > 30) localRecipes = localRecipes.slice(0, 30);
+        localStorage.setItem(LOCAL_RECIPES_KEY, JSON.stringify([newRecipe, ...localRecipes]));
       } catch (localErr) {
         console.error("Local storage error:", localErr);
       }
 
-      // 3. UIの即時反映
       setRecipes(prev => [newRecipe, ...prev].filter((v, i, a) => a.findIndex(t => t.id === v.id) === i).sort((a,b) => b.id - a.id));
-      
       setRecipeForm({ menuName: '', description: '', image: '' });
       alert('レシピを投稿しました！');
     } catch (e) {
@@ -436,7 +447,6 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
     );
   }
 
-  // ポイント進捗計算
   const pointProgress = Math.min((member.points / 10) * 100, 100);
 
   return (
@@ -620,7 +630,7 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
                         <div className="bg-white/70 p-4 rounded-2xl border border-indigo-100 mb-5 space-y-3 shadow-inner">
                           <div className="flex gap-2">
                             <i className="fa-solid fa-circle-exclamation text-indigo-600 mt-1 text-[10px]"></i>
-                            <p className="text-[9px] text-indigo-900 font-bold leading-tight">Square購入時に、本アプリと同じメールアドレスをご使用ください。</p>
+                            <p className="text-[9px] text-indigo-900 font-bold leading-tight">Square購入時に、本アプリと同じメールアドレスをご使用ください。決済完了後購入キーが送られてきます。</p>
                           </div>
                         </div>
 
@@ -635,7 +645,6 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
                           <div className="pt-4 border-t border-indigo-100">
                             <p className="text-[10px] font-black text-indigo-400 uppercase tracking-widest mb-2 ml-1">ログインキーをお持ちの方</p>
                             <div className="flex gap-2 items-center">
-                              {/* ボタンを左側に配置、サイズ固定 */}
                               <button 
                                 onClick={handleVerifyKey}
                                 disabled={isVerifyingKey || !inputKey}
@@ -643,7 +652,6 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
                               >
                                 {isVerifyingKey ? '確認中' : '有効化'}
                               </button>
-                              {/* 入力欄を右側に配置 */}
                               <input 
                                 type="text" 
                                 placeholder="キーを入力" 
@@ -668,11 +676,12 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
 
             {activeTab === 'omikuji' && (
               <div className="text-center py-10 animate-fade-in flex flex-col items-center justify-center min-h-[450px]">
-                {omikujiResult && omikujiResult.date === new Date().toDateString() ? (
+                {omikujiResult && omikujiResult.date === todayStr ? (
                   <div className="bg-white p-10 rounded-[3rem] border-4 border-orange-500 shadow-2xl scale-110">
                     <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Today's Fortune</p>
                     <h4 className="text-7xl font-black text-orange-600 mb-4 tracking-tighter">{omikujiResult.result}</h4>
                     <div className="bg-orange-50 text-orange-700 py-4 px-6 rounded-2xl font-black text-sm border border-orange-100">特典: {omikujiResult.benefit}</div>
+                    <p className="text-[10px] text-slate-400 mt-6 italic">毎日東京時間0時にリセットされます</p>
                   </div>
                 ) : (
                   <>
@@ -681,8 +690,8 @@ const Membership: React.FC<MembershipProps> = ({ member, onRegister, onLogin, on
                       <p className="text-lg font-black text-orange-500">運だめしおみくじ毎日開催中！</p>
                     </div>
                     <button 
-                      onClick={() => setOmikujiResult({ date: new Date().toDateString(), result: Math.random() > 0.85 ? '大吉' : '吉', benefit: '次回50円引きクーポン' })} 
-                      className="w-56 h-56 bg-orange-600 text-white rounded-[4rem] font-black text-3xl shadow-2xl border-4 border-orange-400 active:scale-90 hover:rotate-6 transition-all"
+                      onClick={handleDrawOmikuji} 
+                      className="w-56 h-56 bg-orange-600 text-white rounded-[4rem] font-black text-3xl shadow-2xl border-4 border-orange-400 active:scale-90 hover:rotate-6 transition-all flex items-center justify-center"
                     >
                       運試し！
                     </button>
